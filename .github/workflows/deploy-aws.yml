@@ -1,0 +1,40 @@
+name: Build and publish Daily Market Digest image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'tests/**'
+      - '.github/workflows/daily-market-digest.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Resolve ECR repository
+        id: ecr
+        shell: bash
+        run: echo "uri=$(aws ecr describe-repositories --repository-names daily-market-digest --query 'repositories[0].repositoryUri' --output text)" >> "$GITHUB_OUTPUT"
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push image
+        env:
+          ECR_URI: ${{ steps.ecr.outputs.uri }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR_URI:$IMAGE_TAG" -t "$ECR_URI:latest" .
+          docker push "$ECR_URI:$IMAGE_TAG"
+          docker push "$ECR_URI:latest"

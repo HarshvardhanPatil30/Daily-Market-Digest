@@ -1,0 +1,65 @@
+name: Daily Market Digest - AWS fallback watchdog
+
+on:
+  schedule:
+    # 16:30–18:15 Asia/Kolkata. AWS is primary at 16:00; this workflow
+    # periodically checks shared DynamoDB state and only claims failed/missed runs.
+    - cron: '*/15 11-12 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: daily-market-digest-fallback
+  cancel-in-progress: false
+
+jobs:
+  fallback-if-needed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+      DMD_STATE_TABLE: daily-market-digest-run-state
+      DMD_STATE_BUCKET: ${{ vars.DMD_STATE_BUCKET }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: '465'
+      TIMEZONE: Asia/Kolkata
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Run only if AWS failed or missed its deadline
+        run: python scripts/run_automated.py --mode github-fallback
+
+      - name: Save fallback diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-fallback-logs-${{ github.run_id }}
+          path: logs/market_digest.log
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Daily Market Digest - ECS scheduled primary runner and shared failover state.
+Parameters:
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets with outbound internet access for yfinance, Google News, ECR and Gmail SMTP.
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security group allowing outbound HTTPS and SMTP submission; no inbound rules are required.
+  EmailSecretArn:
+    Type: String
+    Description: ARN of a Secrets Manager JSON secret with EMAIL_FROM, EMAIL_TO and GMAIL_APP_PASSWORD keys.
+  GitHubOidcProviderArn:
+    Type: String
+    Description: ARN of the existing token.actions.githubusercontent.com OIDC provider in this AWS account.
+  GitHubRepository:
+    Type: String
+    Description: GitHub repository in owner/name format, for example octo-org/daily-market-digest.
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch allowed to assume the GitHub Actions role.
+Resources:
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: daily-market-digest
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+  RunStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: daily-market-digest-run-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: run_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_date
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  HistoryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'daily-market-digest-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/daily-market-digest
+      RetentionInDays: 30
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: daily-market-digest
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadDigestEmailSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref EmailSecretArn
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DigestRunStateAndHistory
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt RunStateTable.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${HistoryBucket.Arn}/*'
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: daily-market-digest
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: daily-market-digest
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/daily-market-digest:latest'
+          Essential: true
+          Command: [python, scripts/run_automated.py, --mode, aws]
+          Environment:
+            - { Name: DMD_STATE_TABLE, Value: !Ref RunStateTable }
+            - { Name: DMD_STATE_BUCKET, Value: !Ref HistoryBucket }
+            - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+            - { Name: TIMEZONE, Value: Asia/Kolkata }
+            - { Name: PYTHONUNBUFFERED, Value: '1' }
+          Secrets:
+            - Name: EMAIL_FROM
+              ValueFrom: !Sub '${EmailSecretArn}:EMAIL_FROM::'
+            - Name: EMAIL_TO
+              ValueFrom: !Sub '${EmailSecretArn}:EMAIL_TO::'
+            - Name: GMAIL_APP_PASSWORD
+              ValueFrom: !Sub '${EmailSecretArn}:GMAIL_APP_PASSWORD::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: digest
+          StopTimeout: 120
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartDigestTask
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Ref TaskDefinition
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt EcsCluster.Arn
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt TaskRole.Arn]
+                Condition:
+                  StringLike:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+  PrimarySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: daily-market-digest-weekdays
+      Description: Primary weekday Daily Market Digest run at 16:00 Asia/Kolkata.
+      State: ENABLED
+      ScheduleExpression: 'cron(0 16 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: Asia/Kolkata
+      FlexibleTimeWindow:
+        Mode: OFF
+      Target:
+        Arn: !GetAtt EcsCluster.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        EcsParameters:
+          TaskDefinitionArn: !Ref TaskDefinition
+          TaskCount: 1
+          LaunchType: FARGATE
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              AssignPublicIp: ENABLED
+              Subnets: !Ref SubnetIds
+              SecurityGroups: !Ref SecurityGroupIds
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 3600
+          MaximumRetryAttempts: 2
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'daily-market-digest-github-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}'
+      Policies:
+        - PolicyName: DigestFallbackAndImagePublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt RunStateTable.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${HistoryBucket.Arn}/*'
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:DescribeRepositories, ecr:BatchCheckLayerAvailability, ecr:CompleteLayerUpload, ecr:InitiateLayerUpload, ecr:PutImage, ecr:UploadLayerPart, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !GetAtt ImageRepository.Arn
+Outputs:
+  EcrRepositoryUri:
+    Description: Push the Docker image to this repository.
+    Value: !GetAtt ImageRepository.RepositoryUri
+  StateTableName:
+    Value: !Ref RunStateTable
+  HistoryBucketName:
+    Value: !Ref HistoryBucket
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  GitHubActionsRoleArn:
+    Value: !GetAtt GitHubActionsRole.Arn
+  LogGroupName:
+    Value: !Ref LogGroup

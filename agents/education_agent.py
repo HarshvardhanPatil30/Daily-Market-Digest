@@ -1,0 +1,4 @@
+from models.schemas import EducationTerm
+GLOSSARY=[EducationTerm("Liquidity","The ease of buying or selling an asset without materially moving its price.","Highly liquid shares usually have many active buyers and sellers.","Liquidity can affect transaction costs and the ability to enter or exit a position.","Curated offline glossary"),EducationTerm("Volatility","The degree to which an asset's price varies over time.","Large and frequent price moves indicate higher volatility.","It helps describe uncertainty and risk; it is not a forecast.","Curated offline glossary"),EducationTerm("Diversification","Spreading exposure across different investments.","A portfolio may hold assets that do not all respond the same way to events.","It can reduce concentration risk, though it cannot eliminate loss.","Curated offline glossary")]
+class FinancialEducationAgent:
+    def run(self, prior_terms=()): return next((x for x in GLOSSARY if x.term not in prior_terms), GLOSSARY[0])
