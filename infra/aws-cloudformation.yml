@@ -20,6 +20,15 @@ Parameters:
     Type: String
     Default: main
     Description: Branch allowed to assume the GitHub Actions role.
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Backward-compatible initial tag; bootstrap deployments should explicitly set bootstrap, then CI replaces it with immutable tags.
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Bootstrap deployments must explicitly set DISABLED; ENABLED default preserves existing stack behavior.
 Resources:
   ImageRepository:
     Type: AWS::ECR::Repository
@@ -27,9 +36,14 @@ Resources:
       RepositoryName: daily-market-digest
       ImageScanningConfiguration:
         ScanOnPush: true
-      ImageTagMutability: MUTABLE
+      ImageTagMutability: IMMUTABLE_WITH_EXCLUSION
+      ImageTagMutabilityExclusionFilters:
+        - ImageTagMutabilityExclusionFilterType: WILDCARD
+          ImageTagMutabilityExclusionFilterValue: latest
       EncryptionConfiguration:
         EncryptionType: AES256
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
   RunStateTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -43,6 +57,8 @@ Resources:
           KeyType: HASH
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
   HistoryBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -58,11 +74,25 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldNoncurrentReportVersions
+            Status: Enabled
+            Prefix: reports/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 180
+              NewerNoncurrentVersions: 3
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: /ecs/daily-market-digest
       RetentionInDays: 30
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
   EcsCluster:
     Type: AWS::ECS::Cluster
     Properties:
@@ -101,10 +131,10 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Action: ['dynamodb:GetItem', 'dynamodb:UpdateItem']
                 Resource: !GetAtt RunStateTable.Arn
               - Effect: Allow
-                Action: [s3:GetObject, s3:PutObject]
+                Action: ['s3:GetObject', 's3:PutObject']
                 Resource: !Sub '${HistoryBucket.Arn}/*'
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -118,15 +148,20 @@ Resources:
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
         - Name: daily-market-digest
-          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/daily-market-digest:latest'
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/daily-market-digest:${ImageTag}'
           Essential: true
           Command: [python, scripts/run_automated.py, --mode, aws]
           Environment:
-            - { Name: DMD_STATE_TABLE, Value: !Ref RunStateTable }
-            - { Name: DMD_STATE_BUCKET, Value: !Ref HistoryBucket }
-            - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
-            - { Name: TIMEZONE, Value: Asia/Kolkata }
-            - { Name: PYTHONUNBUFFERED, Value: '1' }
+            - Name: DMD_STATE_TABLE
+              Value: !Ref RunStateTable
+            - Name: DMD_STATE_BUCKET
+              Value: !Ref HistoryBucket
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: TIMEZONE
+              Value: Asia/Kolkata
+            - Name: PYTHONUNBUFFERED
+              Value: '1'
           Secrets:
             - Name: EMAIL_FROM
               ValueFrom: !Sub '${EmailSecretArn}:EMAIL_FROM::'
@@ -172,11 +207,11 @@ Resources:
     Properties:
       Name: daily-market-digest-weekdays
       Description: Primary weekday Daily Market Digest run at 16:00 Asia/Kolkata.
-      State: ENABLED
+      State: !Ref ScheduleState
       ScheduleExpression: 'cron(0 16 ? * MON-FRI *)'
       ScheduleExpressionTimezone: Asia/Kolkata
       FlexibleTimeWindow:
-        Mode: OFF
+        Mode: 'OFF'
       Target:
         Arn: !GetAtt EcsCluster.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
@@ -214,17 +249,38 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Action: ['dynamodb:GetItem', 'dynamodb:UpdateItem']
                 Resource: !GetAtt RunStateTable.Arn
               - Effect: Allow
-                Action: [s3:GetObject, s3:PutObject]
+                Action: ['s3:GetObject', 's3:PutObject']
                 Resource: !Sub '${HistoryBucket.Arn}/*'
               - Effect: Allow
-                Action: [ecr:GetAuthorizationToken]
+                Action: ['ecr:GetAuthorizationToken']
                 Resource: '*'
               - Effect: Allow
-                Action: [ecr:DescribeRepositories, ecr:BatchCheckLayerAvailability, ecr:CompleteLayerUpload, ecr:InitiateLayerUpload, ecr:PutImage, ecr:UploadLayerPart, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Action: ['ecr:DescribeRepositories', 'ecr:BatchCheckLayerAvailability', 'ecr:CompleteLayerUpload', 'ecr:InitiateLayerUpload', 'ecr:PutImage', 'ecr:UploadLayerPart', 'ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer']
                 Resource: !GetAtt ImageRepository.Arn
+              - Effect: Allow
+                Action: ['cloudformation:UpdateStack', 'cloudformation:DescribeStacks', 'cloudformation:DescribeStackEvents']
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/daily-market-digest/*'
+              - Effect: Allow
+                Action: ['ecs:RegisterTaskDefinition', 'ecs:DescribeTaskDefinition', 'ecs:DeregisterTaskDefinition']
+                Resource: '*'
+              - Effect: Allow
+                Action: ['scheduler:GetSchedule', 'scheduler:UpdateSchedule']
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/daily-market-digest-weekdays'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt TaskRole.Arn]
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SchedulerRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: scheduler.amazonaws.com
 Outputs:
   EcrRepositoryUri:
     Description: Push the Docker image to this repository.

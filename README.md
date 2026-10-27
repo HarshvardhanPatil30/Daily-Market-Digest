@@ -105,13 +105,13 @@ The AWS primary scheduler with GitHub Actions fallback described below supersede
 
 ## AWS primary scheduler with GitHub Actions fallback
 
-The normal market-data, agent, SQLite, and ReportLab backend is unchanged. The automation wrapper (`scripts/run_automated.py`) calls the existing `python main.py run` and `python main.py email-latest` commands. AWS EventBridge Scheduler starts an ECS Fargate task at 16:00 Asia/Kolkata on weekdays. GitHub Actions checks the shared DynamoDB status every 15 minutes after 16:30 and only takes over if no AWS run exists, AWS recorded a failure, or the AWS lease has expired. A completed/email-sent state prevents the normal duplicate fallback.
+The normal market-data, agent, SQLite, and ReportLab backend is unchanged. The automation wrapper (`scripts/run_automated.py`) calls the existing `python main.py run` and `python main.py email-latest` commands. AWS EventBridge Scheduler starts an ECS Fargate task at 16:00 Asia/Kolkata on weekdays. GitHub Actions checks shared DynamoDB status every 15 minutes after 16:30 and only takes over if no AWS run exists, AWS recorded a pre-email failure, or the AWS lease expired. Email-pending, email-ambiguous, email-sent, and completed states prevent an automatic duplicate fallback.
 
 ### AWS resources and first-time setup
 
 1. Create a Gmail App Password (with Google 2-Step Verification enabled). Store a JSON secret in AWS Secrets Manager with keys `EMAIL_FROM`, `EMAIL_TO`, and `GMAIL_APP_PASSWORD`. Never commit these values.
 2. Ensure the AWS account has the GitHub Actions OIDC identity provider `token.actions.githubusercontent.com` (audience `sts.amazonaws.com`).
-3. Deploy `infra/aws-cloudformation.yml` in the same AWS region used by GitHub Actions. Supply subnet IDs with outbound internet access, an outbound-only security group, the Secrets Manager ARN, the OIDC provider ARN, and the GitHub repository (`owner/repo`). Public subnet/NAT egress is needed for Yahoo Finance, Google News and Gmail SMTP; no inbound rule is required.
+3. Bootstrap `infra/aws-cloudformation.yml` in the same AWS region used by GitHub Actions. Supply subnet IDs with outbound internet access, an outbound-only security group, the Secrets Manager ARN, the OIDC provider ARN, and the GitHub repository (`owner/repo`). For a new stack, explicitly pass `ScheduleState=DISABLED` and `ImageTag=bootstrap`; the defaults preserve existing-stack behavior. The first task definition may reference an image not yet in ECR, but no task is scheduled while disabled. Public subnet/NAT egress is needed for Yahoo Finance, Google News and Gmail SMTP; no inbound rule is required.
    Example command (replace every placeholder; run from the project root after configuring AWS CLI credentials):
 
    ```bash
@@ -125,20 +125,25 @@ The normal market-data, agent, SQLite, and ReportLab backend is unchanged. The a
        EmailSecretArn="arn:aws:secretsmanager:REGION:ACCOUNT:secret:SECRET-NAME" \
        GitHubOidcProviderArn="arn:aws:iam::ACCOUNT:oidc-provider/token.actions.githubusercontent.com" \
        GitHubRepository="OWNER/REPO" \
-       GitHubBranch="main"
+       GitHubBranch="main" \
+       ScheduleState="DISABLED" \
+       ImageTag="bootstrap"
    ```
 
    After deployment, get the outputs with `aws cloudformation describe-stacks --stack-name daily-market-digest --query 'Stacks[0].Outputs' --output table`.
 4. Copy the CloudFormation output `GitHubActionsRoleArn` into GitHub repository secret `AWS_ROLE_ARN`. Add repository variables `AWS_REGION` for the stack region and `DMD_STATE_BUCKET` using the CloudFormation `HistoryBucketName` output. Add GitHub secrets `EMAIL_FROM`, `EMAIL_TO`, and `GMAIL_APP_PASSWORD` for the fallback runner.
-5. Push the project to the configured `main` branch. The `Build and publish Daily Market Digest image` workflow publishes the container to ECR. The first image must be published before the first successful ECS run.
-6. Check the EventBridge schedule, ECS task logs in CloudWatch (`/ecs/daily-market-digest`), GitHub Actions logs, the DynamoDB table `daily-market-digest-run-state`, and the S3 bucket output by CloudFormation. Trigger the fallback workflow manually only after 16:30 IST; before then it intentionally skips.
+5. After the stack exists, add the OIDC role ARN and AWS region to GitHub settings as described above. Push the reviewed project to `main`. The release workflow runs tests, publishes an immutable `<commit-sha>-<run-id>-<run-attempt>` image tag, then updates the stack's `ImageTag` parameter. ECR keeps only the legacy `latest` alias mutable for upgrade compatibility; new releases do not publish or deploy it. This step does not enable the schedule.
+6. Review the successful workflow and CloudFormation update. Run a controlled ECS task and inspect its output, database state, report, and delivery before deciding to enable normal email distribution.
+7. Enable the EventBridge schedule only after human review, for example with `aws cloudformation deploy --template-file infra/aws-cloudformation.yml --stack-name daily-market-digest --capabilities CAPABILITY_NAMED_IAM --parameter-overrides ScheduleState=ENABLED`. Omitted existing parameters must retain their deployed values; verify the change set before execution.
+8. Check the schedule, ECS task logs in CloudWatch (`/ecs/daily-market-digest`), GitHub Actions logs, DynamoDB table `daily-market-digest-run-state`, and S3 bucket. Trigger fallback only after 16:30 IST; before then it intentionally skips.
 
 ### Coordination and limits
 
 - DynamoDB is the cross-run lock/status source. SQLite remains the application history and is downloaded/uploaded at `state/market_digest.db` in the private, versioned S3 bucket. Generated PDFs are also copied to S3.
 - The GitHub fallback uses AWS OIDC, not long-lived AWS access keys. Its role is scoped to the configured repository branch and the project's state/storage/ECR resources.
 - The GitHub watchdog checks every 15 minutes from 16:30 through 18:15 IST. If AWS is still within its 45-minute lease, it waits rather than starting a concurrent run.
-- SMTP does not provide true exactly-once delivery. The shared state prevents normal duplicate runs, but a crash after Gmail accepts a message and before the success state is recorded can leave an ambiguous delivery outcome.
+- Before SMTP starts, DynamoDB records `email_pending`, which blocks automatic retries. A process/SMTP failure becomes `email_ambiguous`; a hard crash may leave `email_pending`. Both require checking recipient delivery and run logs before a human changes state or authorizes a retry. SMTP still cannot provide true exactly-once delivery.
 - The workflow runs only on weekdays, not on the Indian exchange holiday calendar. On holidays, live data validation may fail; the app must not invent missing prices.
-- This AWS setup may incur charges for ECS/Fargate, CloudWatch, S3, DynamoDB and networking. Review AWS pricing and set billing alerts before enabling it.
+- Recurring or usage charges include Fargate CPU/memory runtime per task; DynamoDB on-demand requests and point-in-time recovery; S3 current objects and retained noncurrent versions; CloudWatch ingestion/storage; ECR image storage and scanning; Secrets Manager secret storage/API requests; and internet egress or NAT gateway processing/hourly charges. Actual amounts depend on region, task duration, log volume, retained versions, requests, and network design. The lifecycle rule only removes noncurrent `reports/` versions older than 180 days while keeping the newest three noncurrent versions; it does not expire current reports or any `state/` database versions. Set a budget after estimating these inputs; no AWS price estimate has been verified for a selected region/account.
+- CloudFormation retains the history bucket, run-state table, ECR repository, and log group on stack deletion/replacement. Retained resources need an explicit manual backup/cleanup policy; deleting the stack does not delete these resources.
 
