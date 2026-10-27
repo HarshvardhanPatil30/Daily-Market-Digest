@@ -38,6 +38,7 @@ jobs:
         run: python -m pytest -q
 
   publish-image:
+    if: github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
     permissions:
