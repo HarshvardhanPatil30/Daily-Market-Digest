@@ -2,9 +2,10 @@ name: Daily Market Digest - AWS fallback watchdog
 
 on:
   schedule:
-    # 16:30–18:15 Asia/Kolkata. AWS is primary at 16:00; this workflow
-    # periodically checks shared DynamoDB state and only claims failed/missed runs.
-    - cron: '*/15 11-12 * * 1-5'
+    # 16:30–18:15 Asia/Kolkata.
+    # AWS is primary at 16:00; this workflow checks shared state for recovery.
+    - cron: '*/15 11 * * 1-5'
+    - cron: '0,15 12 * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -19,6 +20,7 @@ jobs:
   fallback-if-needed:
     runs-on: ubuntu-latest
     timeout-minutes: 35
+
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
@@ -50,7 +52,7 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
       - name: Run only if AWS failed or missed its deadline
         run: python scripts/run_automated.py --mode github-fallback
