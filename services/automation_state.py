@@ -9,7 +9,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 
-TERMINAL_STATUSES = {"completed", "email_sent"}
+TERMINAL_STATUSES = {"completed", "email_sent", "email_pending", "email_ambiguous"}
 LEASE_SECONDS = int(os.getenv("DMD_RUN_LEASE_SECONDS", "2700"))
 
 
@@ -134,7 +134,7 @@ class AutomationState:
                 "REMOVE lease_until"
             ),
             ConditionExpression=(
-                "#owner=:owner AND #status=:running "
+                "#owner=:owner AND #status=:pending "
                 "AND claim_token=:token AND lease_until >= :now_epoch"
             ),
             ExpressionAttributeNames={
@@ -149,8 +149,48 @@ class AutomationState:
                 ":pdf": pdf_key,
                 ":owner": owner,
                 ":token": token,
-                ":running": "running",
+                ":pending": "email_pending",
                 ":now_epoch": now_epoch,
+            },
+        )
+
+    def mark_email_pending(self, run_date, owner, token, execution_id, trading_date, pdf_key):
+        """Persist a no-retry barrier before invoking SMTP."""
+        now = utc_now()
+        now_epoch = int(now.timestamp())
+        self.table.update_item(
+            Key={"run_date": str(run_date)},
+            UpdateExpression=(
+                "SET #status=:pending, updated_at=:now, email_attempted_at=:now, "
+                "execution_id=:execution, trading_date=:trading, pdf_key=:pdf"
+            ),
+            ConditionExpression=(
+                "#owner=:owner AND #status=:running AND claim_token=:token "
+                "AND lease_until >= :now_epoch"
+            ),
+            ExpressionAttributeNames={"#status": "status", "#owner": "owner"},
+            ExpressionAttributeValues={
+                ":pending": "email_pending", ":running": "running", ":now": now.isoformat(),
+                ":execution": execution_id, ":trading": str(trading_date), ":pdf": pdf_key,
+                ":owner": owner, ":token": token, ":now_epoch": now_epoch,
+            },
+        )
+
+    def mark_email_ambiguous(self, run_date, owner, token, error):
+        """Record an uncertain SMTP result without making the run retryable."""
+        self.table.update_item(
+            Key={"run_date": str(run_date)},
+            UpdateExpression=(
+                "SET #status=:ambiguous, updated_at=:now, #error=:error REMOVE lease_until"
+            ),
+            ConditionExpression=(
+                "#owner=:owner AND #status=:pending AND claim_token=:token"
+            ),
+            ExpressionAttributeNames={"#status": "status", "#owner": "owner", "#error": "error"},
+            ExpressionAttributeValues={
+                ":ambiguous": "email_ambiguous", ":pending": "email_pending",
+                ":now": utc_now().isoformat(), ":error": str(error)[:2000],
+                ":owner": owner, ":token": token,
             },
         )
 

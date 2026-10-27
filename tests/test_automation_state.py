@@ -2,7 +2,8 @@ from datetime import date
 
 from botocore.exceptions import ClientError
 
-from services.automation_state import AutomationState
+from services.automation_state import AutomationState, TERMINAL_STATUSES
+from scripts.run_automated import IST, FALLBACK_AFTER_HOUR, FALLBACK_AFTER_MINUTE
 
 
 class FakeTable:
@@ -131,3 +132,28 @@ def test_pdf_upload_uses_trading_date_partition(monkeypatch, tmp_path):
     assert key == "reports/2026/10/22/market_digest_2026-10-22.pdf"
     assert s3.uploads[0][0][1:] == ("bucket", key)
     assert s3.uploads[0][1]["ExtraArgs"]["ContentType"] == "application/pdf"
+
+
+def test_market_day_uses_ist_across_utc_midnight():
+    from datetime import datetime, timezone
+    utc = datetime(2026, 10, 26, 20, 0, tzinfo=timezone.utc)
+    assert utc.astimezone(IST).date().isoformat() == "2026-10-27"
+
+
+def test_fallback_deadline_is_after_1630_ist():
+    assert (FALLBACK_AFTER_HOUR, FALLBACK_AFTER_MINUTE) == (16, 30)
+
+
+def test_email_pending_is_a_durable_no_retry_barrier(monkeypatch):
+    state, table, _ = make_state(monkeypatch)
+    state.mark_email_pending(date(2026, 10, 27), "aws", "token", "exec", "2026-10-27", "reports/file.pdf")
+    assert table.kwargs["ExpressionAttributeValues"][":pending"] == "email_pending"
+    assert "#status=:running" in table.kwargs["ConditionExpression"]
+    assert "lease_until" in table.kwargs["ConditionExpression"]
+    assert "email_pending" in TERMINAL_STATUSES
+
+
+def test_ambiguous_email_state_cannot_be_claimed_as_terminal(monkeypatch):
+    state, _, _ = make_state(monkeypatch)
+    state.table.item = {"status": "email_ambiguous"}
+    assert state.is_terminal(date(2026, 10, 27))

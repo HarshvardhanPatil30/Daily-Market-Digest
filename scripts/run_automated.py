@@ -90,7 +90,8 @@ def main(argv=None):
     configure_logging()
     log = logging.getLogger("automation")
     now = datetime.now(IST)
-    run_date = now.date()
+    # Key fallback runs to the local market day, even after midnight UTC.
+    run_date = now.astimezone(IST).date()
     owner = args.mode
 
     if now.weekday() >= 5:
@@ -126,7 +127,7 @@ def main(argv=None):
         return 0
 
     db_path = settings.database_path
-    email_submitted = False
+    email_attempted = False
 
     try:
         restored = state.restore_database(db_path)
@@ -163,6 +164,13 @@ def main(argv=None):
         pdf_key = state.save_pdf(pdf_path, trading_date)
         state.save_database(db_path)
 
+        # Set a durable retry barrier before SMTP: an interrupted or failed
+        # SMTP exchange may still have been accepted by the remote server.
+        state.mark_email_pending(
+            run_date, owner, token, row["execution_id"], row["trading_date"], pdf_key
+        )
+        email_attempted = True
+
         run_with_lease(
             [sys.executable, "main.py", "email-latest"],
             120,
@@ -172,9 +180,6 @@ def main(argv=None):
             token,
             log,
         )
-
-        # SMTP may have accepted the message even if a later state update fails.
-        email_submitted = True
 
         state.mark_email_sent(
             run_date,
@@ -203,11 +208,15 @@ def main(argv=None):
         except Exception:
             log.exception("Could not persist SQLite database to S3")
 
-        if email_submitted:
+        if email_attempted:
             log.critical(
-                "Email subprocess returned success, but a later step failed. "
-                "Do not automatically resend without checking delivery and state."
+                "Email delivery may be ambiguous. The run is blocked from automatic retry; "
+                "check Gmail delivery and DynamoDB status before manual recovery."
             )
+            try:
+                state.mark_email_ambiguous(run_date, owner, token, f"{type(exc).__name__}: {exc}")
+            except Exception:
+                log.exception("Could not record ambiguous email outcome; email_pending remains a no-retry barrier")
         else:
             try:
                 state.fail(run_date, owner, token, f"{type(exc).__name__}: {exc}")
