@@ -1,11 +1,6 @@
 name: Daily Market Digest - AWS fallback watchdog
 
 on:
-  schedule:
-    # 16:30–18:15 Asia/Kolkata (11:00–12:45 UTC).
-    # AWS is primary at 16:00; this workflow checks shared state for recovery.
-    - cron: '*/15 11 * * 1-5'
-    - cron: '0,15,30,45 12 * * 1-5'
   workflow_dispatch:
 
 permissions:
