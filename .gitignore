@@ -7,3 +7,24 @@ logs/*.log
 data/*.db
 reports/**/*.pdf
 .venv312/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+.venv312/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local data and generated outputs
+data/
+reports/
+logs/
+
+# OS/editor files
+.DS_Store
+.vscode/
